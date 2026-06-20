@@ -107,44 +107,28 @@ const SECRET_PATTERNS = [
 ];
 
 // =========================
-// 🚫 NOISE FILTER (NEW FIX)
+// 🚫 NOISE FILTER
 // =========================
 
 function shouldSkipFile(item) {
   const path = (item.path || "").toLowerCase();
 
-  // markdown / docs noise
-  if (
+  return (
     path.endsWith(".md") ||
     path.endsWith(".markdown") ||
     path.includes("readme") ||
     path.includes("license") ||
-    path.includes("changelog")
-  ) return true;
-
-  // documentation folders
-  if (
+    path.includes("changelog") ||
     path.includes("/docs/") ||
     path.includes("/doc/") ||
-    path.includes("/documentation/")
-  ) return true;
-
-  // samples / examples
-  if (
+    path.includes("/documentation/") ||
     path.includes("/example/") ||
     path.includes("/examples/") ||
     path.includes("/sample/") ||
-    path.includes("/samples/")
-  ) return true;
-
-  // common non-source junk
-  if (
-    path.includes(".min.js") ||
+    path.includes("/samples/") ||
     path.includes(".map") ||
     path.includes("package-lock.json")
-  ) return true;
-
-  return false;
+  );
 }
 
 // =========================
@@ -177,14 +161,18 @@ function detectSecrets(content) {
 }
 
 // =========================
-// GITHUB SEARCH
+// 🔥 UPDATED SEARCH (30 DAYS ONLY)
 // =========================
 
 async function searchKeyword(keyword) {
   try {
+    const date = new Date();
+    date.setDate(date.getDate() - 30);
+    const isoDate = date.toISOString().split("T")[0];
+
     const url = `https://api.github.com/search/code?q=${encodeURIComponent(
       keyword
-    )}+in:file`;
+    )}+in:file+pushed:>=${isoDate}`;
 
     const res = await axios.get(url, {
       headers: {
@@ -234,7 +222,7 @@ async function fetchFileContent(item) {
 }
 
 // =========================
-// DB INSERT (SAFE)
+// DB INSERT
 // =========================
 
 async function safeInsert(item, keyword, score, severity) {
@@ -268,7 +256,6 @@ async function processKeyword(keyword) {
 
   for (const item of results) {
     try {
-      // 🚫 HARD SKIP NOISE FILES EARLY
       if (shouldSkipFile(item)) {
         console.log("🚫 Skipped noisy file:", item.path);
         continue;
