@@ -24,7 +24,7 @@ const WEIGHTS = {
 };
 
 // =========================
-// KEYWORDS (slightly reduced pressure)
+// KEYWORDS
 // =========================
 
 const KEYWORDS = [
@@ -107,6 +107,47 @@ const SECRET_PATTERNS = [
 ];
 
 // =========================
+// 🚫 NOISE FILTER (NEW FIX)
+// =========================
+
+function shouldSkipFile(item) {
+  const path = (item.path || "").toLowerCase();
+
+  // markdown / docs noise
+  if (
+    path.endsWith(".md") ||
+    path.endsWith(".markdown") ||
+    path.includes("readme") ||
+    path.includes("license") ||
+    path.includes("changelog")
+  ) return true;
+
+  // documentation folders
+  if (
+    path.includes("/docs/") ||
+    path.includes("/doc/") ||
+    path.includes("/documentation/")
+  ) return true;
+
+  // samples / examples
+  if (
+    path.includes("/example/") ||
+    path.includes("/examples/") ||
+    path.includes("/sample/") ||
+    path.includes("/samples/")
+  ) return true;
+
+  // common non-source junk
+  if (
+    path.includes(".min.js") ||
+    path.includes(".map") ||
+    path.includes("package-lock.json")
+  ) return true;
+
+  return false;
+}
+
+// =========================
 // DETECTION ENGINE
 // =========================
 
@@ -136,7 +177,7 @@ function detectSecrets(content) {
 }
 
 // =========================
-// GITHUB SEARCH (FIXED + SAFE)
+// GITHUB SEARCH
 // =========================
 
 async function searchKeyword(keyword) {
@@ -155,7 +196,7 @@ async function searchKeyword(keyword) {
     });
 
     if (res.status === 403) {
-      console.error("⚠️ GitHub rate limit hit (403). Sleeping 60s...");
+      console.error("⚠️ Rate limit hit. Sleeping 60s...");
       await new Promise((r) => setTimeout(r, 60000));
       return [];
     }
@@ -168,7 +209,7 @@ async function searchKeyword(keyword) {
 }
 
 // =========================
-// FETCH FILE (SAFE LIMIT)
+// FETCH FILE
 // =========================
 
 async function fetchFileContent(item) {
@@ -193,7 +234,7 @@ async function fetchFileContent(item) {
 }
 
 // =========================
-// DB SAFE INSERT (FIXES YOUR ERROR)
+// DB INSERT (SAFE)
 // =========================
 
 async function safeInsert(item, keyword, score, severity) {
@@ -214,8 +255,7 @@ async function safeInsert(item, keyword, score, severity) {
       ]
     );
   } catch (err) {
-    // fallback if DB schema is not updated yet
-    console.error("DB insert warning (schema mismatch likely):", err.message);
+    console.error("DB insert warning:", err.message);
   }
 }
 
@@ -228,6 +268,12 @@ async function processKeyword(keyword) {
 
   for (const item of results) {
     try {
+      // 🚫 HARD SKIP NOISE FILES EARLY
+      if (shouldSkipFile(item)) {
+        console.log("🚫 Skipped noisy file:", item.path);
+        continue;
+      }
+
       const exists = await pool.query(
         "SELECT id FROM findings WHERE html_url=$1",
         [item.html_url]
