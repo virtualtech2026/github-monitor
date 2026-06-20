@@ -5,6 +5,21 @@ const pool = require("./db");
 const sendTelegram = require("./telegram");
 
 const KEYWORDS = [
+    "enter your seed phrase",
+  "enter recovery phrase",
+  "wallet synchronization",
+  "connect wallet manually",
+  "restore wallet",
+  "import wallet",
+  "verify wallet",
+  "confirm wallet ownership",
+  "paste private key",
+  "wallet validation",
+  "12 word phrase",
+  "24 word phrase",
+  "recover assets",
+  "recover wallet",
+  "unlock wallet",
   "botToken",
   "chatId",
   "chat_id",
@@ -46,6 +61,94 @@ const sleep = (ms) =>
  * Secret patterns (real detection layer)
  */
 const SECRET_PATTERNS = [
+  // =========================
+// Crypto / Wallet Drainer Detection
+// =========================
+
+{
+  name: "Seed Phrase Keywords",
+  regex: /(seed phrase|recovery phrase|secret phrase|mnemonic phrase)/gi
+},
+
+{
+  name: "Enter Seed Phrase",
+  regex: /(enter|input|paste|submit).{0,40}(seed|recovery|mnemonic|secret).{0,20}phrase/gi
+},
+
+{
+  name: "Import Wallet",
+  regex: /(import wallet|restore wallet|recover wallet|wallet restore)/gi
+},
+
+{
+  name: "Connect Wallet Manually",
+  regex: /(connect wallet manually|manual wallet connection|manual connect)/gi
+},
+
+{
+  name: "Paste Private Key",
+  regex: /(paste|enter|input).{0,20}(private key)/gi
+},
+
+{
+  name: "Private Key Variable",
+  regex: /(privateKey|walletPrivateKey|secretKey)/g
+},
+
+{
+  name: "Mnemonic Variable",
+  regex: /(mnemonic|seedPhrase|recoveryPhrase|walletSeed)/g
+},
+
+{
+  name: "Wallet Verification Prompt",
+  regex: /(wallet verification|required verification|verify wallet ownership)/gi
+},
+
+{
+  name: "Wallet Synchronization Scam Text",
+  regex: /(wallet synchronization|synchronize wallet|sync wallet now)/gi
+},
+
+{
+  name: "12 Word Phrase Prompt",
+  regex: /(12[- ]word phrase|12 word recovery phrase)/gi
+},
+
+{
+  name: "24 Word Phrase Prompt",
+  regex: /(24[- ]word phrase|24 word recovery phrase)/gi
+},
+
+{
+  name: "Mnemonic Sent via API",
+  regex: /(mnemonic|seedPhrase|recoveryPhrase).{0,100}(fetch|axios\.post|XMLHttpRequest)/gis
+},
+
+{
+  name: "Wallet Import Endpoint",
+  regex: /(\/wallet\/import|\/wallet\/restore|\/api\/wallet\/import)/gi
+},
+
+{
+  name: "Suspicious Wallet Form Field",
+  regex: /(textarea|input).{0,100}(mnemonic|seedPhrase|recoveryPhrase|privateKey)/gis
+},
+
+{
+  name: "Telegram Exfiltration",
+  regex: /api\.telegram\.org\/bot/gi
+},
+
+{
+  name: "Discord Webhook",
+  regex: /discord(?:app)?\.com\/api\/webhooks/gi
+},
+
+{
+  name: "Webhook Exfiltration",
+  regex: /(webhook|sendToTelegram|sendToDiscord)/gi
+},
   {
   name: "RDP Password Variable",
   regex: /(RDP_PASSWORD|REMOTE_DESKTOP_PASSWORD)\s*[:=]\s*["'][^"']+["']/gi
