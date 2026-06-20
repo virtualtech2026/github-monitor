@@ -11,7 +11,31 @@ const KEYWORDS = [
   "MNEMONIC",
   "SEED_PHRASE",
   "-BEGIN PRIVATE KEY-",
+  "remote desktop",
+  "rdp",
+  "cpanel",
+  "whm",
+  "webmail",
+  "roundcube",
+  "horde",
+  "smtp",
+  "mail_password",
+  "email_password",
+  "smtp_password",
+  "CPANEL_PASSWORD=",
   "https://api.telegram.org/bot",
+  "database.sql",
+  "backup.sql",
+  "wallet.dat",
+  "id_ed25519",
+  "id_rsa",
+  "service-account.json",
+  "credentials.json",
+  "config.json",
+  "config.js",
+  ".env.local",
+  ".env.production",
+  ".env",
   "PRIVATE_KEY"
 ];
 
@@ -22,6 +46,78 @@ const sleep = (ms) =>
  * Secret patterns (real detection layer)
  */
 const SECRET_PATTERNS = [
+  {
+  name: "RDP Password Variable",
+  regex: /(RDP_PASSWORD|REMOTE_DESKTOP_PASSWORD)\s*[:=]\s*["'][^"']+["']/gi
+},
+  {
+  name: "Windows Admin Credentials",
+  regex: /(administrator|admin)\s*[:=]\s*["'][^"']{6,}["']/gi
+},
+  {
+  name: "cPanel Credentials",
+  regex: /(CPANEL_PASSWORD|CPANEL_USER|CPANEL_USERNAME)\s*[:=]\s*["'][^"']+["']/gi
+},
+{
+  name: "Webmail Credentials",
+  regex: /(WEBMAIL_PASSWORD|EMAIL_PASSWORD|MAIL_PASSWORD)\s*[:=]\s*["'][^"']+["']/gi
+},
+  {
+  name: "SMTP Credentials",
+  regex: /(SMTP_USER|SMTP_USERNAME|SMTP_PASS|SMTP_PASSWORD)\s*[:=]\s*["'][^"']+["']/gi
+},
+  {
+  name: "Generic Login Credentials",
+  regex: /(username|user|login)\s*[:=]\s*["'][^"']+["'].*?(password|pass)\s*[:=]\s*["'][^"']+["']/gis
+},
+  // Paystack (example detection)
+
+  {
+
+    name: "Paystack Secret Key",
+
+    regex: /sk_(live|test)_[A-Za-z0-9]{20,}/gi
+
+  },
+  // Flutterwave (example detection)
+
+  {
+
+    name: "Flutterwave Secret Key",
+
+    regex: /FLW(SECK|SECK_TEST)-[A-Za-z0-9_-]+/gi
+
+  },
+
+// Telegram
+
+  {
+
+    name: "Telegram Bot Token",
+
+    regex: /\b\d{8,12}:[A-Za-z0-9_-]{35}\b/g
+
+  },
+
+// BIP39 Seed Phrase (heuristic only)
+
+  {
+
+    name: "Possible Seed Phrase",
+
+    regex: /\b(?:abandon|ability|able|about|above|absent|absorb).{20,200}/gi
+
+  },
+    // SMTP Password Variables
+
+  {
+
+    name: "SMTP Credentials",
+
+    regex: /(SMTP_PASS|MAIL_PASSWORD|EMAIL_PASSWORD)\s*[:=]\s*["'][^"']+["']/gi
+
+  },
+
   {
     name: "GitHub Token",
     regex: /ghp_[A-Za-z0-9]{36}/g
