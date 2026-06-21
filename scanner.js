@@ -403,4 +403,4 @@ async function startWorker() {
   }
 }
 
-startWorker();r
+startWorker();
