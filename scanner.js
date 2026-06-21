@@ -35,13 +35,13 @@ const KEYWORDS = [
   "private key",
   "mnemonic",
   "cpanel",
-  "webmail",
+  "wallet sync",
   "rdp",
-  "smtp",
-  "api key",
-  "secret key",
-  "paystack",
-  "flutterwave",
+  "recover assets",
+  "wallet authentication",
+  "wallet sync",
+  "asset recovery",
+  "wallet validation",
 ];
 
 // =========================
@@ -74,7 +74,7 @@ const SECRET_PATTERNS = [
     regex: /api\.telegram\.org\/bot/i,
     severity: "critical",
   },
-  {
+/*  {
     name: "Discord Webhook",
     regex: /discord(app)?\.com\/api\/webhooks/i,
     severity: "critical",
@@ -98,37 +98,53 @@ const SECRET_PATTERNS = [
     name: "Flutterwave Key",
     regex: /FLW(SECK|SECK_TEST)-[A-Za-z0-9_-]+/gi,
     severity: "critical",
-  },
+  }, 
   {
     name: "Database URL",
     regex: /(mongodb|postgres|mysql):\/\/[^\s"']+/gi,
     severity: "critical",
-  },
+  }, */
 ];
 
 // =========================
-// 🚫 NOISE FILTER
+// 🚫 NOISE FILTER (NEW FIX)
 // =========================
 
 function shouldSkipFile(item) {
   const path = (item.path || "").toLowerCase();
 
-  return (
+  // markdown / docs noise
+  if (
     path.endsWith(".md") ||
     path.endsWith(".markdown") ||
     path.includes("readme") ||
     path.includes("license") ||
-    path.includes("changelog") ||
+    path.includes("changelog")
+  ) return true;
+
+  // documentation folders
+  if (
     path.includes("/docs/") ||
     path.includes("/doc/") ||
-    path.includes("/documentation/") ||
+    path.includes("/documentation/")
+  ) return true;
+
+  // samples / examples
+  if (
     path.includes("/example/") ||
     path.includes("/examples/") ||
     path.includes("/sample/") ||
-    path.includes("/samples/") ||
+    path.includes("/samples/")
+  ) return true;
+
+  // common non-source junk
+  if (
+    path.includes(".min.js") ||
     path.includes(".map") ||
     path.includes("package-lock.json")
-  );
+  ) return true;
+
+  return false;
 }
 
 // =========================
@@ -161,18 +177,14 @@ function detectSecrets(content) {
 }
 
 // =========================
-// 🔥 UPDATED SEARCH (30 DAYS ONLY)
+// GITHUB SEARCH
 // =========================
 
 async function searchKeyword(keyword) {
   try {
-    const date = new Date();
-    date.setDate(date.getDate() - 30);
-    const isoDate = date.toISOString().split("T")[0];
-
     const url = `https://api.github.com/search/code?q=${encodeURIComponent(
       keyword
-    )}+in:file+pushed:>=${isoDate}`;
+    )}+in:file`;
 
     const res = await axios.get(url, {
       headers: {
@@ -222,7 +234,7 @@ async function fetchFileContent(item) {
 }
 
 // =========================
-// DB INSERT
+// DB INSERT (SAFE)
 // =========================
 
 async function safeInsert(item, keyword, score, severity) {
@@ -256,6 +268,7 @@ async function processKeyword(keyword) {
 
   for (const item of results) {
     try {
+      // 🚫 HARD SKIP NOISE FILES EARLY
       if (shouldSkipFile(item)) {
         console.log("🚫 Skipped noisy file:", item.path);
         continue;
