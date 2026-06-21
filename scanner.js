@@ -14,12 +14,15 @@ const HIGH_CONFIDENCE_THRESHOLD = 35;
 const MAX_FILE_SIZE = 800000;
 const BASE_SLEEP = 5000;
 
+const ALERT_COOLDOWN = 6 * 60 * 60 * 1000; // 6 hours
+
 // =========================
 // STATE CACHE
 // =========================
 
 const processedUrls = new Set();
 const repoCache = new Map();
+const alertedRepos = new Map(); // 🔥 FIX: prevents repeat alerts across cycles
 
 // =========================
 // WEIGHTS
@@ -33,7 +36,7 @@ const WEIGHTS = {
 };
 
 // =========================
-// HELPERS (NEW)
+// HELPERS
 // =========================
 
 function buildRepoUrl(repoName) {
@@ -197,7 +200,7 @@ function computeRepoScore(repo) {
 // =========================
 
 async function searchKeyword(keyword) {
-  const url = `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file`;
+  const url = `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file&per_page=30&sort=indexed`;
 
   try {
     const res = await axios.get(url, {
@@ -242,7 +245,10 @@ async function processKeyword(keyword) {
 
   for (const item of results) {
     try {
-      if (processedUrls.has(item.html_url)) continue;
+      const repoName = item.repository.full_name;
+      const hash = `${repoName}:${item.path}`;
+
+      if (processedUrls.has(hash)) continue;
       if (shouldSkipFile(item)) continue;
 
       const content = await fetchFile(item);
@@ -250,9 +256,9 @@ async function processKeyword(keyword) {
 
       const signals = extractSignals(content);
 
-      updateRepo(item.repository.full_name, signals);
+      updateRepo(repoName, signals);
 
-      processedUrls.add(item.html_url);
+      processedUrls.add(hash);
 
     } catch (err) {
       console.error("Process error:", err.message);
@@ -261,15 +267,26 @@ async function processKeyword(keyword) {
 }
 
 // =========================
-// SOC CARD ALERT (NEW)
+// SOC ALERT ENGINE (FIXED + NO REPEATS)
 // =========================
 
 async function evaluateRepos() {
+  const now = Date.now();
+
   for (const [repoName, repo] of repoCache.entries()) {
 
     const score = computeRepoScore(repo);
     const risk = getRiskBadge(score);
     const repoUrl = buildRepoUrl(repoName);
+
+    // 🔥 COOLDOWN CHECK (FIX REPEATS)
+    if (alertedRepos.has(repoName)) {
+      const last = alertedRepos.get(repoName);
+      if (now - last < ALERT_COOLDOWN) {
+        console.log("⏳ Skipping repeat alert:", repoName);
+        continue;
+      }
+    }
 
     await pool.query(
       `INSERT INTO findings (keyword, repo_name, file_path, html_url, score, severity)
@@ -280,15 +297,20 @@ async function evaluateRepos() {
 
     if (score >= ALERT_THRESHOLD) {
 
+      alertedRepos.set(repoName, now); // 🔥 LOCK ALERT
+
       await sendTelegram(
-`🚨 SOC INTELLIGENCE CARD
+`🚨 SOC POLLING INTELLIGENCE CARD
 
 ━━━━━━━━━━━━━━━━━━
 ${risk}
 ━━━━━━━━━━━━━━━━━━
 
-📦 Repo: ${repoName}
-🔗 GitHub: ${repoUrl}
+📦 Repository
+${repoName}
+
+🔗 GitHub Link
+${repoUrl}
 
 📊 Risk Score: ${score.toFixed(2)}
 
@@ -299,8 +321,8 @@ ${risk}
 ⚠️ Legit Penalty: ${repo.legitPenalty}
 
 ━━━━━━━━━━━━━━━━━━
-Threat Type: Wallet Drainer / Web3 Phishing
 Confidence: ${score >= HIGH_CONFIDENCE_THRESHOLD ? "HIGH" : "MEDIUM"}
+Scan Type: Polling Scanner (GitHub Search API)
 ━━━━━━━━━━━━━━━━━━`
       );
 
@@ -334,7 +356,7 @@ async function runCycle() {
 // =========================
 
 async function startWorker() {
-  console.log("🚀 SOC Drainer Classifier started");
+  console.log("🚀 SOC Polling Scanner started");
 
   while (true) {
     try {
