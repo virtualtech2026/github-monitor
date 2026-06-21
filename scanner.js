@@ -8,7 +8,7 @@ const sendTelegram = require("./telegram");
 // CONFIG
 // =========================
 
-const ALERT_THRESHOLD = 15;
+const ALERT_THRESHOLD = 20;
 const MAX_FILE_SIZE = 800000;
 const BASE_SLEEP = 5000;
 
@@ -28,20 +28,48 @@ const WEIGHTS = {
 // =========================
 
 const KEYWORDS = [
+  "wallet drainer",
+  "crypto drainer",
+  "wallet connect phishing",
+  "wallet connect scam",
   "seed phrase",
   "recovery phrase",
-  "wallet import",
+  "mnemonic phrase",
+  "import wallet",
+  "restore wallet",
   "connect wallet",
-  "private key",
-  "mnemonic",
-  "cpanel",
-  "wallet sync",
-  "rdp",
-  "recover assets",
-  "wallet authentication",
-  "wallet sync",
-  "asset recovery",
+  "wallet verification",
   "wallet validation",
+  "wallet synchronization",
+  "wallet migration",
+  "claim airdrop",
+  "claim rewards",
+  "claim token",
+  "claim nft",
+  "free mint",
+  "wallet checker",
+  "wallet recovery",
+  "wallet unlock",
+  "wallet authenticate",
+  "wallet session expired",
+  "walletconnect",
+  "walletconnect v2",
+  "web3 modal",
+  "rainbowkit",
+  "wagmi",
+  "ethers.js",
+  "drain wallet",
+  "sweep wallet",
+  "sweeper bot",
+  "auto transfer",
+  "auto withdraw",
+  "transfer all balance",
+  "send max balance",
+  "setapprovalforall",
+  "permit2",
+  "signTypedData",
+  "eth_signTypedData",
+  "personal_sign"
 ];
 
 // =========================
@@ -50,23 +78,23 @@ const KEYWORDS = [
 
 const SECRET_PATTERNS = [
   {
-    name: "Seed Phrase Prompt",
+    name: "Seed Phrase Collection",
     regex: /(seed phrase|recovery phrase|mnemonic phrase)/gi,
     severity: "high",
   },
   {
-    name: "Enter Seed Phrase",
-    regex: /(enter|input|paste|submit).{0,40}(seed|recovery|mnemonic)/gi,
-    severity: "critical",
+    name: "Wallet Recovery Prompt",
+    regex: /(import|restore|recover).{0,50}(wallet)/gi,
+    severity: "high",
   },
   {
-    name: "Private Key",
-    regex: /(private key|walletPrivateKey|secretKey)/gi,
+    name: "Seed Phrase Submission",
+    regex: /(enter|input|paste|submit).{0,50}(seed|mnemonic|recovery)/gi,
     severity: "critical",
   },
   {
     name: "12/24 Word Phrase",
-    regex: /(12[- ]word|24[- ]word).{0,20}(phrase|seed)/gi,
+    regex: /(12|24)[ -]?word.{0,30}(phrase|seed)/gi,
     severity: "critical",
   },
   {
@@ -74,36 +102,56 @@ const SECRET_PATTERNS = [
     regex: /api\.telegram\.org\/bot/i,
     severity: "critical",
   },
-/*  {
+  {
     name: "Discord Webhook",
     regex: /discord(app)?\.com\/api\/webhooks/i,
     severity: "critical",
   },
   {
-    name: "AWS Key",
-    regex: /AKIA[0-9A-Z]{16}/g,
+    name: "Webhook Exfiltration",
+    regex: /https?:\/\/.*webhook/i,
     severity: "critical",
   },
   {
-    name: "Google API Key",
-    regex: /AIza[0-9A-Za-z\-_]{35}/g,
+    name: "Wallet Approval Abuse",
+    regex: /setApprovalForAll/gi,
+    severity: "high",
+  },
+  {
+    name: "Unlimited Allowance",
+    regex: /increaseAllowance/gi,
+    severity: "high",
+  },
+  {
+    name: "Permit Signature Abuse",
+    regex: /permit2?/gi,
+    severity: "high",
+  },
+  {
+    name: "Typed Data Signature",
+    regex: /eth_signTypedData/gi,
+    severity: "medium",
+  },
+  {
+    name: "Personal Sign Request",
+    regex: /personal_sign/gi,
+    severity: "medium",
+  },
+  {
+    name: "WalletConnect Usage",
+    regex: /walletconnect/gi,
+    severity: "medium",
+  },
+  {
+    name: "Transfer Entire Balance",
+    regex: /(transfer all balance|send max balance|drain wallet|sweep wallet)/gi,
     severity: "critical",
   },
   {
-    name: "Paystack Secret",
-    regex: /sk_(live|test)_[A-Za-z0-9]{20,}/gi,
-    severity: "critical",
-  },
-  {
-    name: "Flutterwave Key",
-    regex: /FLW(SECK|SECK_TEST)-[A-Za-z0-9_-]+/gi,
-    severity: "critical",
-  }, 
-  {
-    name: "Database URL",
-    regex: /(mongodb|postgres|mysql):\/\/[^\s"']+/gi,
-    severity: "critical",
-  }, */
+    name: "Targeted Wallet Brands",
+    regex: /(metamask|trust wallet|coinbase wallet|phantom|rainbow|safepal|exodus|ledger|trezor)/gi,
+    severity: "medium",
+  }
 ];
 
 // =========================
