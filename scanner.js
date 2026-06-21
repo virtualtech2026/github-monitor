@@ -14,7 +14,7 @@ const HIGH_CONFIDENCE_THRESHOLD = 35;
 const MAX_FILE_SIZE = 800000;
 const BASE_SLEEP = 5000;
 
-const ALERT_COOLDOWN = 6 * 60 * 60 * 1000; // 6 hours
+const ALERT_COOLDOWN = 6 * 60 * 60 * 1000;
 
 // =========================
 // STATE CACHE
@@ -22,7 +22,10 @@ const ALERT_COOLDOWN = 6 * 60 * 60 * 1000; // 6 hours
 
 const processedUrls = new Set();
 const repoCache = new Map();
-const alertedRepos = new Map(); // 🔥 FIX: prevents repeat alerts across cycles
+const alertedRepos = new Map();
+
+// 🔥 FIX: global dedupe across ALL pages & keywords
+const globalRepoSeen = new Set();
 
 // =========================
 // WEIGHTS
@@ -196,23 +199,38 @@ function computeRepoScore(repo) {
 }
 
 // =========================
-// GITHUB SEARCH
+// 🔥 FIXED: PAGINATED SEARCH (CORE FIX)
 // =========================
 
 async function searchKeyword(keyword) {
-  const url = `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file&per_page=30&sort=indexed`;
+  const allResults = [];
 
   try {
-    const res = await axios.get(url, {
-      headers: {
-        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-        "User-Agent": "org-scanner"
-      }
-    });
+    for (let page = 1; page <= 5; page++) {
 
-    return res.data?.items || [];
-  } catch {
-    return [];
+      const url =
+        `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file` +
+        `&per_page=30&page=${page}&sort=indexed`;
+
+      const res = await axios.get(url, {
+        headers: {
+          Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+          "User-Agent": "org-scanner"
+        }
+      });
+
+      const items = res.data?.items || [];
+
+      if (items.length === 0) break;
+
+      allResults.push(...items);
+    }
+
+    return allResults;
+
+  } catch (e) {
+    console.error("Search error:", e.message);
+    return allResults;
   }
 }
 
@@ -248,7 +266,10 @@ async function processKeyword(keyword) {
       const repoName = item.repository.full_name;
       const hash = `${repoName}:${item.path}`;
 
+      // 🔥 global dedupe (fix repeated cycles + pagination overlap)
       if (processedUrls.has(hash)) continue;
+      if (globalRepoSeen.has(repoName)) continue;
+
       if (shouldSkipFile(item)) continue;
 
       const content = await fetchFile(item);
@@ -259,6 +280,7 @@ async function processKeyword(keyword) {
       updateRepo(repoName, signals);
 
       processedUrls.add(hash);
+      globalRepoSeen.add(repoName);
 
     } catch (err) {
       console.error("Process error:", err.message);
@@ -267,7 +289,7 @@ async function processKeyword(keyword) {
 }
 
 // =========================
-// SOC ALERT ENGINE (FIXED + NO REPEATS)
+// SOC ALERT ENGINE
 // =========================
 
 async function evaluateRepos() {
@@ -276,10 +298,14 @@ async function evaluateRepos() {
   for (const [repoName, repo] of repoCache.entries()) {
 
     const score = computeRepoScore(repo);
-    const risk = getRiskBadge(score);
+    const risk =
+      score >= 35 ? "🔴 CONFIRMED DRAINER" :
+      score >= 25 ? "🟠 HIGH RISK" :
+      score >= 15 ? "🟡 SUSPICIOUS" :
+      "🟢 LOW RISK";
+
     const repoUrl = buildRepoUrl(repoName);
 
-    // 🔥 COOLDOWN CHECK (FIX REPEATS)
     if (alertedRepos.has(repoName)) {
       const last = alertedRepos.get(repoName);
       if (now - last < ALERT_COOLDOWN) {
@@ -297,7 +323,7 @@ async function evaluateRepos() {
 
     if (score >= ALERT_THRESHOLD) {
 
-      alertedRepos.set(repoName, now); // 🔥 LOCK ALERT
+      alertedRepos.set(repoName, now);
 
       await sendTelegram(
 `🚨 SOC POLLING INTELLIGENCE CARD
@@ -322,7 +348,7 @@ ${repoUrl}
 
 ━━━━━━━━━━━━━━━━━━
 Confidence: ${score >= HIGH_CONFIDENCE_THRESHOLD ? "HIGH" : "MEDIUM"}
-Scan Type: Polling Scanner (GitHub Search API)
+Scan Type: GitHub Polling (Paginated)
 ━━━━━━━━━━━━━━━━━━`
       );
 
@@ -340,6 +366,7 @@ async function runCycle() {
 
   processedUrls.clear();
   repoCache.clear();
+  globalRepoSeen.clear(); // 🔥 FIX
 
   for (const keyword of KEYWORDS) {
     await processKeyword(keyword);
