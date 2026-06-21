@@ -13,6 +13,12 @@ const MAX_FILE_SIZE = 800000;
 const BASE_SLEEP = 5000;
 
 // =========================
+// DEDUP CACHE (FIX #1)
+// =========================
+
+const processedUrls = new Set();
+
+// =========================
 // WEIGHTS
 // =========================
 
@@ -24,52 +30,54 @@ const WEIGHTS = {
 };
 
 // =========================
-// KEYWORDS
+// KEYWORDS (FIX #5)
 // =========================
 
 const KEYWORDS = [
-  "wallet drainer",
-  "crypto drainer",
-  "wallet connect phishing",
-  "wallet connect scam",
-  "seed phrase",
-  "recovery phrase",
-  "mnemonic phrase",
-  "import wallet",
-  "restore wallet",
-  "connect wallet",
-  "wallet verification",
-  "wallet validation",
-  "wallet synchronization",
-  "wallet migration",
-  "claim airdrop",
-  "claim rewards",
-  "claim token",
-  "claim nft",
-  "free mint",
-  "wallet checker",
-  "wallet recovery",
-  "wallet unlock",
-  "wallet authenticate",
-  "wallet session expired",
-  "walletconnect",
-  "walletconnect v2",
-  "web3 modal",
-  "rainbowkit",
-  "wagmi",
-  "ethers.js",
-  "drain wallet",
-  "sweep wallet",
-  "sweeper bot",
-  "auto transfer",
-  "auto withdraw",
-  "transfer all balance",
-  "send max balance",
-  "setapprovalforall",
-  "permit2",
-  "signTypedData",
-  "eth_signTypedData",
-  "personal_sign"
+  ...new Set([
+    "wallet drainer",
+    "crypto drainer",
+    "wallet connect phishing",
+    "wallet connect scam",
+    "seed phrase",
+    "recovery phrase",
+    "mnemonic phrase",
+    "import wallet",
+    "restore wallet",
+    "connect wallet",
+    "wallet verification",
+    "wallet validation",
+    "wallet synchronization",
+    "wallet migration",
+    "claim airdrop",
+    "claim rewards",
+    "claim token",
+    "claim nft",
+    "free mint",
+    "wallet checker",
+    "wallet recovery",
+    "wallet unlock",
+    "wallet authenticate",
+    "wallet session expired",
+    "walletconnect",
+    "walletconnect v2",
+    "web3 modal",
+    "rainbowkit",
+    "wagmi",
+    "ethers.js",
+    "drain wallet",
+    "sweep wallet",
+    "sweeper bot",
+    "auto transfer",
+    "auto withdraw",
+    "transfer all balance",
+    "send max balance",
+    "setapprovalforall",
+    "permit2",
+    "signTypedData",
+    "eth_signTypedData",
+    "personal_sign"
+  ])
 ];
 
 // =========================
@@ -155,13 +163,12 @@ const SECRET_PATTERNS = [
 ];
 
 // =========================
-// 🚫 NOISE FILTER (NEW FIX)
+// 🚫 NOISE FILTER
 // =========================
 
 function shouldSkipFile(item) {
   const path = (item.path || "").toLowerCase();
 
-  // markdown / docs noise
   if (
     path.endsWith(".md") ||
     path.endsWith(".markdown") ||
@@ -170,14 +177,12 @@ function shouldSkipFile(item) {
     path.includes("changelog")
   ) return true;
 
-  // documentation folders
   if (
     path.includes("/docs/") ||
     path.includes("/doc/") ||
     path.includes("/documentation/")
   ) return true;
 
-  // samples / examples
   if (
     path.includes("/example/") ||
     path.includes("/examples/") ||
@@ -185,7 +190,6 @@ function shouldSkipFile(item) {
     path.includes("/samples/")
   ) return true;
 
-  // common non-source junk
   if (
     path.includes(".min.js") ||
     path.includes(".map") ||
@@ -230,9 +234,7 @@ function detectSecrets(content) {
 
 async function searchKeyword(keyword) {
   try {
-    const url = `https://api.github.com/search/code?q=${encodeURIComponent(
-      keyword
-    )}+in:file`;
+    const url = `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file`;
 
     const res = await axios.get(url, {
       headers: {
@@ -282,7 +284,7 @@ async function fetchFileContent(item) {
 }
 
 // =========================
-// DB INSERT (SAFE)
+// SAFE INSERT (FIX #4)
 // =========================
 
 async function safeInsert(item, keyword, score, severity) {
@@ -292,6 +294,7 @@ async function safeInsert(item, keyword, score, severity) {
       INSERT INTO findings
       (keyword, repo_name, file_path, html_url, score, severity)
       VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (html_url) DO NOTHING
       `,
       [
         keyword,
@@ -316,7 +319,10 @@ async function processKeyword(keyword) {
 
   for (const item of results) {
     try {
-      // 🚫 HARD SKIP NOISE FILES EARLY
+      // 🚫 FIX #1: in-memory dedupe
+      if (processedUrls.has(item.html_url)) continue;
+
+      // 🚫 HARD SKIP NOISE FILES
       if (shouldSkipFile(item)) {
         console.log("🚫 Skipped noisy file:", item.path);
         continue;
@@ -337,6 +343,9 @@ async function processKeyword(keyword) {
       const severity =
         score >= 15 ? "HIGH" : score >= 7 ? "MEDIUM" : "LOW";
 
+      // mark processed EARLY (prevents duplicates across keywords)
+      processedUrls.add(item.html_url);
+
       await safeInsert(item, keyword, score, severity);
 
       if (score >= ALERT_THRESHOLD) {
@@ -356,6 +365,12 @@ ${JSON.stringify(findings, null, 2)}
 ${item.html_url}`
         );
 
+        // FIX #6: mark alerted
+        await pool.query(
+          "UPDATE findings SET alerted=TRUE WHERE html_url=$1",
+          [item.html_url]
+        );
+
         console.log("🚨 ALERT:", item.html_url);
       } else {
         console.log("✔ OK:", item.html_url);
@@ -367,11 +382,13 @@ ${item.html_url}`
 }
 
 // =========================
-// CYCLE
+// CYCLE (FIX #2)
 // =========================
 
 async function runCycle() {
   console.log("🔄 Scan cycle starting...");
+
+  processedUrls.clear();
 
   for (const keyword of KEYWORDS) {
     console.log("🔎", keyword);
