@@ -17,15 +17,18 @@ const BASE_SLEEP = 5000;
 const ALERT_COOLDOWN = 6 * 60 * 60 * 1000;
 
 // =========================
-// STATE CACHE
+// STATE
 // =========================
 
-const processedUrls = new Set();
-const repoCache = new Map();
-const alertedRepos = new Map();
+const processedFiles = new Set();     // per cycle file dedupe
+const seenReposCycle = new Set();     // per cycle repo dedupe
+const alertedRepos = new Map();       // cooldown tracker
 
-// 🔥 FIX: global dedupe across ALL pages & keywords
-const globalRepoSeen = new Set();
+// =========================
+// BACKOFF STATE (FIX 403)
+// =========================
+
+let githubBackoff = 1000;
 
 // =========================
 // WEIGHTS
@@ -46,39 +49,43 @@ function buildRepoUrl(repoName) {
   return `https://github.com/${repoName}`;
 }
 
-function getRiskBadge(score) {
-  if (score >= 35) return "🔴 CONFIRMED DRAINER";
-  if (score >= 25) return "🟠 HIGH RISK";
-  if (score >= 15) return "🟡 SUSPICIOUS";
-  return "🟢 LOW RISK";
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // =========================
-// KEYWORDS
+// KEYWORD EXPANSION (🔥 FIX #1)
 // =========================
 
-const KEYWORDS = [...new Set([
+function expandKeyword(keyword) {
+  const suffixes = [
+    "",
+    " js",
+    " ethers",
+    " walletconnect",
+    " web3",
+    " phishing",
+    " drain",
+  ];
+
+  return suffixes.map(s => keyword + s);
+}
+
+// =========================
+// BASE KEYWORDS
+// =========================
+
+const BASE_KEYWORDS = [
   "wallet drainer",
   "crypto drainer",
-  "wallet connect phishing",
-  "wallet connect scam",
   "seed phrase",
   "recovery phrase",
   "mnemonic phrase",
-  "import wallet",
-  "restore wallet",
-  "connect wallet",
-  "wallet verification",
-  "claim airdrop",
-  "claim rewards",
-  "free mint",
-  "walletconnect",
-  "wagmi",
-  "ethers.js",
+  "wallet connect phishing",
   "setapprovalforall",
   "permit2",
   "personal_sign"
-])];
+];
 
 // =========================
 // PATTERNS
@@ -162,6 +169,14 @@ function extractSignals(content) {
 // =========================
 
 function updateRepo(repoName, data) {
+  if (!seenReposCycle.has(repoName)) {
+    seenReposCycle.add(repoName);
+  }
+
+  if (!global.repoCache) global.repoCache = new Map();
+
+  const repoCache = global.repoCache;
+
   if (!repoCache.has(repoName)) {
     repoCache.set(repoName, {
       signalScore: 0,
@@ -177,8 +192,6 @@ function updateRepo(repoName, data) {
   repo.behaviorScore += data.behaviorScore;
   repo.legitPenalty += data.legitPenalty;
   repo.files += 1;
-
-  repoCache.set(repoName, repo);
 }
 
 // =========================
@@ -199,39 +212,52 @@ function computeRepoScore(repo) {
 }
 
 // =========================
-// 🔥 FIXED: PAGINATED SEARCH (CORE FIX)
+// GITHUB SEARCH (FIX 403 + BACKOFF)
 // =========================
 
 async function searchKeyword(keyword) {
-  const allResults = [];
+  const results = [];
 
-  try {
-    for (let page = 1; page <= 5; page++) {
+  for (let page = 1; page <= 3; page++) {
+    const url =
+      `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file` +
+      `&per_page=30&page=${page}&sort=indexed`;
 
-      const url =
-        `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file` +
-        `&per_page=30&page=${page}&sort=indexed`;
-
+    try {
       const res = await axios.get(url, {
         headers: {
           Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-          "User-Agent": "org-scanner"
+          "User-Agent": "soc-scanner"
         }
       });
 
+      githubBackoff = 1000; // reset on success
+
       const items = res.data?.items || [];
+      if (!items.length) break;
 
-      if (items.length === 0) break;
+      results.push(...items);
 
-      allResults.push(...items);
+      await sleep(800);
+
+    } catch (err) {
+      const status = err.response?.status;
+
+      if (status === 403) {
+        console.log("⚠️ 403 rate limit hit. backing off...");
+
+        await sleep(githubBackoff);
+        githubBackoff = Math.min(githubBackoff * 2, 60000);
+
+        break;
+      }
+
+      console.error("Search error:", err.message);
+      break;
     }
-
-    return allResults;
-
-  } catch (e) {
-    console.error("Search error:", e.message);
-    return allResults;
   }
+
+  return results;
 }
 
 // =========================
@@ -259,31 +285,31 @@ async function fetchFile(item) {
 // =========================
 
 async function processKeyword(keyword) {
-  const results = await searchKeyword(keyword);
+  const expanded = expandKeyword(keyword);
 
-  for (const item of results) {
-    try {
-      const repoName = item.repository.full_name;
-      const hash = `${repoName}:${item.path}`;
+  for (const q of expanded) {
+    const results = await searchKeyword(q);
 
-      // 🔥 global dedupe (fix repeated cycles + pagination overlap)
-      if (processedUrls.has(hash)) continue;
-      if (globalRepoSeen.has(repoName)) continue;
+    for (const item of results) {
+      try {
+        const repoName = item.repository.full_name;
+        const fileKey = `${repoName}:${item.path}`;
 
-      if (shouldSkipFile(item)) continue;
+        if (processedFiles.has(fileKey)) continue;
+        processedFiles.add(fileKey);
 
-      const content = await fetchFile(item);
-      if (!content) continue;
+        if (shouldSkipFile(item)) continue;
 
-      const signals = extractSignals(content);
+        const content = await fetchFile(item);
+        if (!content) continue;
 
-      updateRepo(repoName, signals);
+        const signals = extractSignals(content);
 
-      processedUrls.add(hash);
-      globalRepoSeen.add(repoName);
+        updateRepo(repoName, signals);
 
-    } catch (err) {
-      console.error("Process error:", err.message);
+      } catch (err) {
+        console.error("Process error:", err.message);
+      }
     }
   }
 }
@@ -293,67 +319,48 @@ async function processKeyword(keyword) {
 // =========================
 
 async function evaluateRepos() {
+  const repoCache = global.repoCache || new Map();
   const now = Date.now();
 
   for (const [repoName, repo] of repoCache.entries()) {
 
     const score = computeRepoScore(repo);
-    const risk =
-      score >= 35 ? "🔴 CONFIRMED DRAINER" :
-      score >= 25 ? "🟠 HIGH RISK" :
-      score >= 15 ? "🟡 SUSPICIOUS" :
-      "🟢 LOW RISK";
 
     const repoUrl = buildRepoUrl(repoName);
 
-    if (alertedRepos.has(repoName)) {
-      const last = alertedRepos.get(repoName);
-      if (now - last < ALERT_COOLDOWN) {
-        console.log("⏳ Skipping repeat alert:", repoName);
-        continue;
-      }
+    const last = alertedRepos.get(repoName);
+    if (last && now - last < ALERT_COOLDOWN) {
+      console.log("⏳ Skipping repeat alert:", repoName);
+      continue;
     }
 
-    await pool.query(
-      `INSERT INTO findings (keyword, repo_name, file_path, html_url, score, severity)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       ON CONFLICT DO NOTHING`,
-      ["repo-analysis", repoName, null, null, score, risk]
-    );
+    if (score < ALERT_THRESHOLD) continue;
 
-    if (score >= ALERT_THRESHOLD) {
+    alertedRepos.set(repoName, now);
 
-      alertedRepos.set(repoName, now);
-
-      await sendTelegram(
+    await sendTelegram(
 `🚨 SOC POLLING INTELLIGENCE CARD
 
 ━━━━━━━━━━━━━━━━━━
-${risk}
+${score >= HIGH_CONFIDENCE_THRESHOLD ? "🔴 CONFIRMED DRAINER" : "🟠 HIGH RISK"}
 ━━━━━━━━━━━━━━━━━━
 
-📦 Repository
-${repoName}
+📦 Repo: ${repoName}
+🔗 ${repoUrl}
 
-🔗 GitHub Link
-${repoUrl}
+📊 Score: ${score.toFixed(2)}
+📁 Files: ${repo.files}
 
-📊 Risk Score: ${score.toFixed(2)}
-
-📁 Files Analyzed: ${repo.files}
-
-🧬 Signal Score: ${repo.signalScore}
-⚙️ Behavior Score: ${repo.behaviorScore}
-⚠️ Legit Penalty: ${repo.legitPenalty}
+🧬 Signal: ${repo.signalScore}
+⚙️ Behavior: ${repo.behaviorScore}
+⚠️ Penalty: ${repo.legitPenalty}
 
 ━━━━━━━━━━━━━━━━━━
-Confidence: ${score >= HIGH_CONFIDENCE_THRESHOLD ? "HIGH" : "MEDIUM"}
-Scan Type: GitHub Polling (Paginated)
+Scan: GitHub Polled + Expanded Queries
 ━━━━━━━━━━━━━━━━━━`
-      );
+    );
 
-      console.log("🚨 ALERT:", repoName);
-    }
+    console.log("🚨 ALERT:", repoName);
   }
 }
 
@@ -364,13 +371,12 @@ Scan Type: GitHub Polling (Paginated)
 async function runCycle() {
   console.log("🔄 Scan cycle started");
 
-  processedUrls.clear();
-  repoCache.clear();
-  globalRepoSeen.clear(); // 🔥 FIX
+  processedFiles.clear();
+  global.repoCache = new Map();
 
-  for (const keyword of KEYWORDS) {
+  for (const keyword of BASE_KEYWORDS) {
     await processKeyword(keyword);
-    await new Promise(r => setTimeout(r, BASE_SLEEP));
+    await sleep(BASE_SLEEP);
   }
 
   await evaluateRepos();
@@ -389,11 +395,12 @@ async function startWorker() {
     try {
       await runCycle();
       console.log("💤 sleeping...");
-      await new Promise(r => setTimeout(r, 10 * 60 * 1000));
+      await sleep(10 * 60 * 1000);
     } catch (e) {
       console.error("Worker crash:", e.message);
+      await sleep(5000);
     }
   }
 }
 
-startWorker();
+startWorker();r
