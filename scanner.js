@@ -17,39 +17,26 @@ const BASE_SLEEP = 5000;
 const ALERT_COOLDOWN = 6 * 60 * 60 * 1000;
 
 // =========================
-// STATE
+// STATE CACHE
 // =========================
 
-const processedFiles = new Set();
+const processedUrls = new Set();
+const repoCache = new Map();
 const alertedRepos = new Map();
 
-// 🔥 GLOBAL SAFE MODE (NEW FIX)
-let globalCooldownUntil = 0;
+// 🔥 FIX: global dedupe across ALL pages & keywords
+const globalRepoSeen = new Set();
 
 // =========================
-// GLOBAL REQUEST THROTTLE (CRITICAL FIX)
+// WEIGHTS
 // =========================
 
-let lastRequestTime = 0;
-const MIN_INTERVAL = 2500; // ~24 req/min safe zone
-
-async function throttleGitHub() {
-  const now = Date.now();
-
-  // global cooldown from 403
-  if (now < globalCooldownUntil) {
-    const wait = globalCooldownUntil - now;
-    console.log(`🧊 Global cooldown active: waiting ${Math.round(wait/1000)}s`);
-    await sleep(wait);
-  }
-
-  const diff = now - lastRequestTime;
-  if (diff < MIN_INTERVAL) {
-    await sleep(MIN_INTERVAL - diff);
-  }
-
-  lastRequestTime = Date.now();
-}
+const WEIGHTS = {
+  low: 1,
+  medium: 3,
+  high: 7,
+  critical: 15,
+};
 
 // =========================
 // HELPERS
@@ -59,25 +46,39 @@ function buildRepoUrl(repoName) {
   return `https://github.com/${repoName}`;
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+function getRiskBadge(score) {
+  if (score >= 35) return "🔴 CONFIRMED DRAINER";
+  if (score >= 25) return "🟠 HIGH RISK";
+  if (score >= 15) return "🟡 SUSPICIOUS";
+  return "🟢 LOW RISK";
 }
 
 // =========================
-// BASE KEYWORDS (NO EXPANSION OVERLOAD)
+// KEYWORDS
 // =========================
 
-const BASE_KEYWORDS = [
+const KEYWORDS = [...new Set([
   "wallet drainer",
   "crypto drainer",
+  "wallet connect phishing",
+  "wallet connect scam",
   "seed phrase",
   "recovery phrase",
   "mnemonic phrase",
-  "walletconnect phishing",
-  "setApprovalForAll",
+  "import wallet",
+  "restore wallet",
+  "connect wallet",
+  "wallet verification",
+  "claim airdrop",
+  "claim rewards",
+  "free mint",
+  "walletconnect",
+  "wagmi",
+  "ethers.js",
+  "setapprovalforall",
   "permit2",
   "personal_sign"
-];
+])];
 
 // =========================
 // PATTERNS
@@ -101,6 +102,17 @@ const BEHAVIOR_PATTERNS = [
   { regex: /(sign|signature).{0,80}(claim|verify|reward|airdrop)/gi, weight: 10 },
   { regex: /(connect wallet).{0,50}(claim|mint|verify)/gi, weight: 9 },
   { regex: /(transferFrom|send max|drain wallet)/gi, weight: 15 }
+];
+
+// =========================
+// LEGIT FILTER
+// =========================
+
+const LEGIT_CONTEXT = [
+  /next\.js|react|vite|nuxt/i,
+  /hardhat|foundry|ethers\.js|wagmi/i,
+  /openzeppelin|uniswap|aave/i,
+  /tutorial|example|template|docs/i
 ];
 
 // =========================
@@ -131,27 +143,27 @@ function extractSignals(content) {
   let legitPenalty = 0;
 
   for (const p of SECRET_PATTERNS) {
-    if (p.regex.test(content)) signalScore += 1;
+    if (p.regex.test(content)) signalScore += WEIGHTS[p.severity] || 0;
   }
 
   for (const b of BEHAVIOR_PATTERNS) {
     if (b.regex.test(content)) behaviorScore += b.weight;
   }
 
+  for (const l of LEGIT_CONTEXT) {
+    if (l.test(content)) legitPenalty += 8;
+  }
+
   return { signalScore, behaviorScore, legitPenalty };
 }
 
 // =========================
-// REPO CACHE
+// REPO AGGREGATOR
 // =========================
 
 function updateRepo(repoName, data) {
-  if (!global.repoCache) global.repoCache = new Map();
-
-  const cache = global.repoCache;
-
-  if (!cache.has(repoName)) {
-    cache.set(repoName, {
+  if (!repoCache.has(repoName)) {
+    repoCache.set(repoName, {
       signalScore: 0,
       behaviorScore: 0,
       legitPenalty: 0,
@@ -159,53 +171,66 @@ function updateRepo(repoName, data) {
     });
   }
 
-  const repo = cache.get(repoName);
+  const repo = repoCache.get(repoName);
 
   repo.signalScore += data.signalScore;
   repo.behaviorScore += data.behaviorScore;
+  repo.legitPenalty += data.legitPenalty;
   repo.files += 1;
+
+  repoCache.set(repoName, repo);
 }
 
 // =========================
-// SCORE
+// SCORE MODEL
 // =========================
 
 function computeRepoScore(repo) {
-  return repo.signalScore + repo.behaviorScore * 1.5;
+  let score =
+    repo.signalScore +
+    repo.behaviorScore * 1.5 -
+    repo.legitPenalty;
+
+  if (repo.behaviorScore > 20 && repo.signalScore > 10) {
+    score += 10;
+  }
+
+  return score;
 }
 
 // =========================
-// GITHUB SEARCH (STABLE + SAFE)
+// 🔥 FIXED: PAGINATED SEARCH (CORE FIX)
 // =========================
 
 async function searchKeyword(keyword) {
-  const url =
-    `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file&per_page=30`;
+  const allResults = [];
 
   try {
-    await throttleGitHub();
+    for (let page = 1; page <= 5; page++) {
 
-    const res = await axios.get(url, {
-      headers: {
-        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-        "User-Agent": "soc-scanner"
-      }
-    });
+      const url =
+        `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file` +
+        `&per_page=30&page=${page}&sort=indexed`;
 
-    return res.data?.items || [];
-  } catch (err) {
-    const status = err.response?.status;
+      const res = await axios.get(url, {
+        headers: {
+          Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+          "User-Agent": "org-scanner"
+        }
+      });
 
-    if (status === 403) {
-      console.log("⚠️ 403 detected → entering 10 min global cooldown");
+      const items = res.data?.items || [];
 
-      globalCooldownUntil = Date.now() + 10 * 60 * 1000;
+      if (items.length === 0) break;
 
-      return [];
+      allResults.push(...items);
     }
 
-    console.error("Search error:", err.message);
-    return [];
+    return allResults;
+
+  } catch (e) {
+    console.error("Search error:", e.message);
+    return allResults;
   }
 }
 
@@ -218,8 +243,6 @@ async function fetchFile(item) {
     const url = item.html_url
       .replace("github.com", "raw.githubusercontent.com")
       .replace("/blob/", "/");
-
-    await throttleGitHub();
 
     const res = await axios.get(url, {
       maxContentLength: MAX_FILE_SIZE
@@ -241,10 +264,11 @@ async function processKeyword(keyword) {
   for (const item of results) {
     try {
       const repoName = item.repository.full_name;
-      const fileKey = `${repoName}:${item.path}`;
+      const hash = `${repoName}:${item.path}`;
 
-      if (processedFiles.has(fileKey)) continue;
-      processedFiles.add(fileKey);
+      // 🔥 global dedupe (fix repeated cycles + pagination overlap)
+      if (processedUrls.has(hash)) continue;
+      if (globalRepoSeen.has(repoName)) continue;
 
       if (shouldSkipFile(item)) continue;
 
@@ -255,6 +279,9 @@ async function processKeyword(keyword) {
 
       updateRepo(repoName, signals);
 
+      processedUrls.add(hash);
+      globalRepoSeen.add(repoName);
+
     } catch (err) {
       console.error("Process error:", err.message);
     }
@@ -262,43 +289,71 @@ async function processKeyword(keyword) {
 }
 
 // =========================
-// ALERT ENGINE
+// SOC ALERT ENGINE
 // =========================
 
 async function evaluateRepos() {
-  const cache = global.repoCache || new Map();
   const now = Date.now();
 
-  for (const [repoName, repo] of cache.entries()) {
+  for (const [repoName, repo] of repoCache.entries()) {
 
     const score = computeRepoScore(repo);
+    const risk =
+      score >= 35 ? "🔴 CONFIRMED DRAINER" :
+      score >= 25 ? "🟠 HIGH RISK" :
+      score >= 15 ? "🟡 SUSPICIOUS" :
+      "🟢 LOW RISK";
 
-    if (score < ALERT_THRESHOLD) continue;
+    const repoUrl = buildRepoUrl(repoName);
 
-    const last = alertedRepos.get(repoName);
-    if (last && now - last < ALERT_COOLDOWN) {
-      console.log("⏳ Skipping repeat alert:", repoName);
-      continue;
+    if (alertedRepos.has(repoName)) {
+      const last = alertedRepos.get(repoName);
+      if (now - last < ALERT_COOLDOWN) {
+        console.log("⏳ Skipping repeat alert:", repoName);
+        continue;
+      }
     }
 
-    alertedRepos.set(repoName, now);
-
-    await sendTelegram(
-`🚨 SOC INTELLIGENCE CARD
-
-📦 Repo: ${repoName}
-🔗 ${buildRepoUrl(repoName)}
-
-📊 Score: ${score.toFixed(2)}
-📁 Files: ${repo.files}
-
-🧬 Signal: ${repo.signalScore}
-⚙️ Behavior: ${repo.behaviorScore}
-
-Scan: Stable Polling Mode`
+    await pool.query(
+      `INSERT INTO findings (keyword, repo_name, file_path, html_url, score, severity)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT DO NOTHING`,
+      ["repo-analysis", repoName, null, null, score, risk]
     );
 
-    console.log("🚨 ALERT:", repoName);
+    if (score >= ALERT_THRESHOLD) {
+
+      alertedRepos.set(repoName, now);
+
+      await sendTelegram(
+`🚨 SOC POLLING INTELLIGENCE CARD
+
+━━━━━━━━━━━━━━━━━━
+${risk}
+━━━━━━━━━━━━━━━━━━
+
+📦 Repository
+${repoName}
+
+🔗 GitHub Link
+${repoUrl}
+
+📊 Risk Score: ${score.toFixed(2)}
+
+📁 Files Analyzed: ${repo.files}
+
+🧬 Signal Score: ${repo.signalScore}
+⚙️ Behavior Score: ${repo.behaviorScore}
+⚠️ Legit Penalty: ${repo.legitPenalty}
+
+━━━━━━━━━━━━━━━━━━
+Confidence: ${score >= HIGH_CONFIDENCE_THRESHOLD ? "HIGH" : "MEDIUM"}
+Scan Type: GitHub Polling (Paginated)
+━━━━━━━━━━━━━━━━━━`
+      );
+
+      console.log("🚨 ALERT:", repoName);
+    }
   }
 }
 
@@ -309,12 +364,13 @@ Scan: Stable Polling Mode`
 async function runCycle() {
   console.log("🔄 Scan cycle started");
 
-  processedFiles.clear();
-  global.repoCache = new Map();
+  processedUrls.clear();
+  repoCache.clear();
+  globalRepoSeen.clear(); // 🔥 FIX
 
-  for (const keyword of BASE_KEYWORDS) {
+  for (const keyword of KEYWORDS) {
     await processKeyword(keyword);
-    await sleep(BASE_SLEEP);
+    await new Promise(r => setTimeout(r, BASE_SLEEP));
   }
 
   await evaluateRepos();
@@ -332,10 +388,10 @@ async function startWorker() {
   while (true) {
     try {
       await runCycle();
-      await sleep(10 * 60 * 1000);
+      console.log("💤 sleeping...");
+      await new Promise(r => setTimeout(r, 10 * 60 * 1000));
     } catch (e) {
       console.error("Worker crash:", e.message);
-      await sleep(5000);
     }
   }
 }
