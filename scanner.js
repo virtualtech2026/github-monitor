@@ -19,7 +19,7 @@ const BASE_SLEEP = 5000;
 // =========================
 
 const processedUrls = new Set();
-const repoCache = new Map(); // 🔥 NEW: repo-level aggregation
+const repoCache = new Map();
 
 // =========================
 // WEIGHTS
@@ -33,7 +33,22 @@ const WEIGHTS = {
 };
 
 // =========================
-// KEYWORDS (unchanged but now only for discovery)
+// HELPERS (NEW)
+// =========================
+
+function buildRepoUrl(repoName) {
+  return `https://github.com/${repoName}`;
+}
+
+function getRiskBadge(score) {
+  if (score >= 35) return "🔴 CONFIRMED DRAINER";
+  if (score >= 25) return "🟠 HIGH RISK";
+  if (score >= 15) return "🟡 SUSPICIOUS";
+  return "🟢 LOW RISK";
+}
+
+// =========================
+// KEYWORDS
 // =========================
 
 const KEYWORDS = [...new Set([
@@ -60,7 +75,7 @@ const KEYWORDS = [...new Set([
 ])];
 
 // =========================
-// PATTERNS (signal-level)
+// PATTERNS
 // =========================
 
 const SECRET_PATTERNS = [
@@ -73,7 +88,7 @@ const SECRET_PATTERNS = [
 ];
 
 // =========================
-// BEHAVIOR PATTERNS (NEW CORE)
+// BEHAVIOR PATTERNS
 // =========================
 
 const BEHAVIOR_PATTERNS = [
@@ -84,7 +99,7 @@ const BEHAVIOR_PATTERNS = [
 ];
 
 // =========================
-// LEGITIMATE CONTEXT FILTER
+// LEGIT FILTER
 // =========================
 
 const LEGIT_CONTEXT = [
@@ -113,7 +128,7 @@ function shouldSkipFile(item) {
 }
 
 // =========================
-// FILE SIGNAL ENGINE
+// SIGNAL ENGINE
 // =========================
 
 function extractSignals(content) {
@@ -122,21 +137,15 @@ function extractSignals(content) {
   let legitPenalty = 0;
 
   for (const p of SECRET_PATTERNS) {
-    if (p.regex.test(content)) {
-      signalScore += WEIGHTS[p.severity] || 0;
-    }
+    if (p.regex.test(content)) signalScore += WEIGHTS[p.severity] || 0;
   }
 
   for (const b of BEHAVIOR_PATTERNS) {
-    if (b.regex.test(content)) {
-      behaviorScore += b.weight;
-    }
+    if (b.regex.test(content)) behaviorScore += b.weight;
   }
 
   for (const l of LEGIT_CONTEXT) {
-    if (l.test(content)) {
-      legitPenalty += 8;
-    }
+    if (l.test(content)) legitPenalty += 8;
   }
 
   return { signalScore, behaviorScore, legitPenalty };
@@ -152,8 +161,7 @@ function updateRepo(repoName, data) {
       signalScore: 0,
       behaviorScore: 0,
       legitPenalty: 0,
-      files: 0,
-      urls: new Set()
+      files: 0
     });
   }
 
@@ -168,7 +176,7 @@ function updateRepo(repoName, data) {
 }
 
 // =========================
-// FINAL SCORE MODEL (CORE INTELLIGENCE)
+// SCORE MODEL
 // =========================
 
 function computeRepoScore(repo) {
@@ -178,7 +186,7 @@ function computeRepoScore(repo) {
     repo.legitPenalty;
 
   if (repo.behaviorScore > 20 && repo.signalScore > 10) {
-    score += 10; // strong drainer signature boost
+    score += 10;
   }
 
   return score;
@@ -200,7 +208,7 @@ async function searchKeyword(keyword) {
     });
 
     return res.data?.items || [];
-  } catch (e) {
+  } catch {
     return [];
   }
 }
@@ -226,7 +234,7 @@ async function fetchFile(item) {
 }
 
 // =========================
-// PROCESS KEYWORD
+// PROCESS
 // =========================
 
 async function processKeyword(keyword) {
@@ -253,40 +261,47 @@ async function processKeyword(keyword) {
 }
 
 // =========================
-// FINAL REPO EVALUATION
+// SOC CARD ALERT (NEW)
 // =========================
 
 async function evaluateRepos() {
   for (const [repoName, repo] of repoCache.entries()) {
 
     const score = computeRepoScore(repo);
-
-    let severity =
-      score >= 35 ? "CONFIRMED DRAINER" :
-      score >= 25 ? "HIGH RISK" :
-      score >= 15 ? "SUSPICIOUS" :
-      "LOW";
+    const risk = getRiskBadge(score);
+    const repoUrl = buildRepoUrl(repoName);
 
     await pool.query(
       `INSERT INTO findings (keyword, repo_name, file_path, html_url, score, severity)
        VALUES ($1,$2,$3,$4,$5,$6)
        ON CONFLICT DO NOTHING`,
-      ["repo-analysis", repoName, null, null, score, severity]
+      ["repo-analysis", repoName, null, null, score, risk]
     );
 
     if (score >= ALERT_THRESHOLD) {
+
       await sendTelegram(
-`🚨 DRAINER INTELLIGENCE ALERT
+`🚨 SOC INTELLIGENCE CARD
 
-Repo: ${repoName}
-Score: ${score}
-Severity: ${severity}
+━━━━━━━━━━━━━━━━━━
+${risk}
+━━━━━━━━━━━━━━━━━━
 
-Files analyzed: ${repo.files}
+📦 Repo: ${repoName}
+🔗 GitHub: ${repoUrl}
 
-SignalScore: ${repo.signalScore}
-BehaviorScore: ${repo.behaviorScore}
-LegitPenalty: ${repo.legitPenalty}`
+📊 Risk Score: ${score.toFixed(2)}
+
+📁 Files Analyzed: ${repo.files}
+
+🧬 Signal Score: ${repo.signalScore}
+⚙️ Behavior Score: ${repo.behaviorScore}
+⚠️ Legit Penalty: ${repo.legitPenalty}
+
+━━━━━━━━━━━━━━━━━━
+Threat Type: Wallet Drainer / Web3 Phishing
+Confidence: ${score >= HIGH_CONFIDENCE_THRESHOLD ? "HIGH" : "MEDIUM"}
+━━━━━━━━━━━━━━━━━━`
       );
 
       console.log("🚨 ALERT:", repoName);
@@ -319,7 +334,7 @@ async function runCycle() {
 // =========================
 
 async function startWorker() {
-  console.log("🚀 Drainer Classifier v2 started");
+  console.log("🚀 SOC Drainer Classifier started");
 
   while (true) {
     try {
