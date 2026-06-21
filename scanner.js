@@ -8,15 +8,18 @@ const sendTelegram = require("./telegram");
 // CONFIG
 // =========================
 
-const ALERT_THRESHOLD = 20;
+const ALERT_THRESHOLD = 25;
+const HIGH_CONFIDENCE_THRESHOLD = 35;
+
 const MAX_FILE_SIZE = 800000;
 const BASE_SLEEP = 5000;
 
 // =========================
-// DEDUP CACHE (FIX #1)
+// STATE CACHE
 // =========================
 
 const processedUrls = new Set();
+const repoCache = new Map(); // 🔥 NEW: repo-level aggregation
 
 // =========================
 // WEIGHTS
@@ -30,202 +33,155 @@ const WEIGHTS = {
 };
 
 // =========================
-// KEYWORDS (FIX #5)
+// KEYWORDS (unchanged but now only for discovery)
 // =========================
 
-const KEYWORDS = [
-  ...new Set([
-    "wallet drainer",
-    "crypto drainer",
-    "wallet connect phishing",
-    "wallet connect scam",
-    "seed phrase",
-    "recovery phrase",
-    "mnemonic phrase",
-    "import wallet",
-    "restore wallet",
-    "connect wallet",
-    "wallet verification",
-    "wallet validation",
-    "wallet synchronization",
-    "wallet migration",
-    "claim airdrop",
-    "claim rewards",
-    "claim token",
-    "claim nft",
-    "free mint",
-    "wallet checker",
-    "wallet recovery",
-    "wallet unlock",
-    "wallet authenticate",
-    "wallet session expired",
-    "walletconnect",
-    "walletconnect v2",
-    "web3 modal",
-    "rainbowkit",
-    "wagmi",
-    "ethers.js",
-    "drain wallet",
-    "sweep wallet",
-    "sweeper bot",
-    "auto transfer",
-    "auto withdraw",
-    "transfer all balance",
-    "send max balance",
-    "setapprovalforall",
-    "permit2",
-    "signTypedData",
-    "eth_signTypedData",
-    "personal_sign"
-  ])
-];
+const KEYWORDS = [...new Set([
+  "wallet drainer",
+  "crypto drainer",
+  "wallet connect phishing",
+  "wallet connect scam",
+  "seed phrase",
+  "recovery phrase",
+  "mnemonic phrase",
+  "import wallet",
+  "restore wallet",
+  "connect wallet",
+  "wallet verification",
+  "claim airdrop",
+  "claim rewards",
+  "free mint",
+  "walletconnect",
+  "wagmi",
+  "ethers.js",
+  "setapprovalforall",
+  "permit2",
+  "personal_sign"
+])];
 
 // =========================
-// PATTERNS
+// PATTERNS (signal-level)
 // =========================
 
 const SECRET_PATTERNS = [
-  {
-    name: "Seed Phrase Collection",
-    regex: /(seed phrase|recovery phrase|mnemonic phrase)/gi,
-    severity: "high",
-  },
-  {
-    name: "Wallet Recovery Prompt",
-    regex: /(import|restore|recover).{0,50}(wallet)/gi,
-    severity: "high",
-  },
-  {
-    name: "Seed Phrase Submission",
-    regex: /(enter|input|paste|submit).{0,50}(seed|mnemonic|recovery)/gi,
-    severity: "critical",
-  },
-  {
-    name: "12/24 Word Phrase",
-    regex: /(12|24)[ -]?word.{0,30}(phrase|seed)/gi,
-    severity: "critical",
-  },
-  {
-    name: "Telegram Exfiltration",
-    regex: /api\.telegram\.org\/bot/i,
-    severity: "critical",
-  },
-  {
-    name: "Discord Webhook",
-    regex: /discord(app)?\.com\/api\/webhooks/i,
-    severity: "critical",
-  },
-  {
-    name: "Webhook Exfiltration",
-    regex: /https?:\/\/.*webhook/i,
-    severity: "critical",
-  },
-  {
-    name: "Wallet Approval Abuse",
-    regex: /setApprovalForAll/gi,
-    severity: "high",
-  },
-  {
-    name: "Unlimited Allowance",
-    regex: /increaseAllowance/gi,
-    severity: "high",
-  },
-  {
-    name: "Permit Signature Abuse",
-    regex: /permit2?/gi,
-    severity: "high",
-  },
-  {
-    name: "Typed Data Signature",
-    regex: /eth_signTypedData/gi,
-    severity: "medium",
-  },
-  {
-    name: "Personal Sign Request",
-    regex: /personal_sign/gi,
-    severity: "medium",
-  },
-  {
-    name: "WalletConnect Usage",
-    regex: /walletconnect/gi,
-    severity: "medium",
-  },
-  {
-    name: "Transfer Entire Balance",
-    regex: /(transfer all balance|send max balance|drain wallet|sweep wallet)/gi,
-    severity: "critical",
-  },
-  {
-    name: "Targeted Wallet Brands",
-    regex: /(metamask|trust wallet|coinbase wallet|phantom|rainbow|safepal|exodus|ledger|trezor)/gi,
-    severity: "medium",
-  }
+  { name: "Seed Phrase", regex: /(seed phrase|recovery phrase|mnemonic)/gi, severity: "critical" },
+  { name: "Wallet Input Theft", regex: /(enter|input|paste).{0,40}(seed|phrase)/gi, severity: "critical" },
+  { name: "Approval Abuse", regex: /setApprovalForAll|increaseAllowance/gi, severity: "high" },
+  { name: "Signature Abuse", regex: /eth_signTypedData|personal_sign/gi, severity: "medium" },
+  { name: "Drain Logic", regex: /(drain wallet|sweep wallet|transfer all balance)/gi, severity: "critical" },
+  { name: "Webhook Exfiltration", regex: /discord|telegram\.org\/bot|webhook/i, severity: "critical" }
 ];
 
 // =========================
-// 🚫 NOISE FILTER
+// BEHAVIOR PATTERNS (NEW CORE)
+// =========================
+
+const BEHAVIOR_PATTERNS = [
+  { regex: /(approve|setApprovalForAll).{0,80}(transfer|drain|sweep)/gi, weight: 12 },
+  { regex: /(sign|signature).{0,80}(claim|verify|reward|airdrop)/gi, weight: 10 },
+  { regex: /(connect wallet).{0,50}(claim|mint|verify)/gi, weight: 9 },
+  { regex: /(transferFrom|send max|drain wallet)/gi, weight: 15 }
+];
+
+// =========================
+// LEGITIMATE CONTEXT FILTER
+// =========================
+
+const LEGIT_CONTEXT = [
+  /next\.js|react|vite|nuxt/i,
+  /hardhat|foundry|ethers\.js|wagmi/i,
+  /openzeppelin|uniswap|aave/i,
+  /tutorial|example|template|docs/i
+];
+
+// =========================
+// NOISE FILTER
 // =========================
 
 function shouldSkipFile(item) {
   const path = (item.path || "").toLowerCase();
 
-  if (
+  return (
     path.endsWith(".md") ||
-    path.endsWith(".markdown") ||
     path.includes("readme") ||
     path.includes("license") ||
-    path.includes("changelog")
-  ) return true;
-
-  if (
     path.includes("/docs/") ||
-    path.includes("/doc/") ||
-    path.includes("/documentation/")
-  ) return true;
-
-  if (
     path.includes("/example/") ||
-    path.includes("/examples/") ||
-    path.includes("/sample/") ||
-    path.includes("/samples/")
-  ) return true;
-
-  if (
-    path.includes(".min.js") ||
     path.includes(".map") ||
     path.includes("package-lock.json")
-  ) return true;
-
-  return false;
+  );
 }
 
 // =========================
-// DETECTION ENGINE
+// FILE SIGNAL ENGINE
 // =========================
 
-function detectSecrets(content) {
-  const findings = [];
-  let score = 0;
+function extractSignals(content) {
+  let signalScore = 0;
+  let behaviorScore = 0;
+  let legitPenalty = 0;
 
   for (const p of SECRET_PATTERNS) {
-    const matches = content.match(p.regex);
-
-    if (matches) {
-      const unique = [...new Set(matches)];
-      const weight = WEIGHTS[p.severity] || 0;
-
-      score += weight;
-
-      findings.push({
-        type: p.name,
-        severity: p.severity,
-        matches: unique,
-        weight,
-      });
+    if (p.regex.test(content)) {
+      signalScore += WEIGHTS[p.severity] || 0;
     }
   }
 
-  return { findings, score };
+  for (const b of BEHAVIOR_PATTERNS) {
+    if (b.regex.test(content)) {
+      behaviorScore += b.weight;
+    }
+  }
+
+  for (const l of LEGIT_CONTEXT) {
+    if (l.test(content)) {
+      legitPenalty += 8;
+    }
+  }
+
+  return { signalScore, behaviorScore, legitPenalty };
+}
+
+// =========================
+// REPO AGGREGATOR
+// =========================
+
+function updateRepo(repoName, data) {
+  if (!repoCache.has(repoName)) {
+    repoCache.set(repoName, {
+      signalScore: 0,
+      behaviorScore: 0,
+      legitPenalty: 0,
+      files: 0,
+      urls: new Set()
+    });
+  }
+
+  const repo = repoCache.get(repoName);
+
+  repo.signalScore += data.signalScore;
+  repo.behaviorScore += data.behaviorScore;
+  repo.legitPenalty += data.legitPenalty;
+  repo.files += 1;
+
+  repoCache.set(repoName, repo);
+}
+
+// =========================
+// FINAL SCORE MODEL (CORE INTELLIGENCE)
+// =========================
+
+function computeRepoScore(repo) {
+  let score =
+    repo.signalScore +
+    repo.behaviorScore * 1.5 -
+    repo.legitPenalty;
+
+  if (repo.behaviorScore > 20 && repo.signalScore > 10) {
+    score += 10; // strong drainer signature boost
+  }
+
+  return score;
 }
 
 // =========================
@@ -233,27 +189,18 @@ function detectSecrets(content) {
 // =========================
 
 async function searchKeyword(keyword) {
-  try {
-    const url = `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file`;
+  const url = `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file`;
 
+  try {
     const res = await axios.get(url, {
       headers: {
         Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "org-secret-scanner",
-      },
-      validateStatus: () => true,
+        "User-Agent": "org-scanner"
+      }
     });
 
-    if (res.status === 403) {
-      console.error("⚠️ Rate limit hit. Sleeping 60s...");
-      await new Promise((r) => setTimeout(r, 60000));
-      return [];
-    }
-
     return res.data?.items || [];
-  } catch (err) {
-    console.error(`Search error (${keyword}):`, err.message);
+  } catch (e) {
     return [];
   }
 }
@@ -262,51 +209,19 @@ async function searchKeyword(keyword) {
 // FETCH FILE
 // =========================
 
-async function fetchFileContent(item) {
+async function fetchFile(item) {
   try {
     const url = item.html_url
       .replace("github.com", "raw.githubusercontent.com")
       .replace("/blob/", "/");
 
     const res = await axios.get(url, {
-      headers: {
-        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-      },
-      maxContentLength: MAX_FILE_SIZE,
+      maxContentLength: MAX_FILE_SIZE
     });
-
-    if (!res.data || res.data.length > MAX_FILE_SIZE) return null;
 
     return res.data;
   } catch {
     return null;
-  }
-}
-
-// =========================
-// SAFE INSERT (FIX #4)
-// =========================
-
-async function safeInsert(item, keyword, score, severity) {
-  try {
-    await pool.query(
-      `
-      INSERT INTO findings
-      (keyword, repo_name, file_path, html_url, score, severity)
-      VALUES ($1,$2,$3,$4,$5,$6)
-      ON CONFLICT (html_url) DO NOTHING
-      `,
-      [
-        keyword,
-        item.repository.full_name,
-        item.path,
-        item.html_url,
-        score,
-        severity,
-      ]
-    );
-  } catch (err) {
-    console.error("DB insert warning:", err.message);
   }
 }
 
@@ -319,62 +234,18 @@ async function processKeyword(keyword) {
 
   for (const item of results) {
     try {
-      // 🚫 FIX #1: in-memory dedupe
       if (processedUrls.has(item.html_url)) continue;
+      if (shouldSkipFile(item)) continue;
 
-      // 🚫 HARD SKIP NOISE FILES
-      if (shouldSkipFile(item)) {
-        console.log("🚫 Skipped noisy file:", item.path);
-        continue;
-      }
-
-      const exists = await pool.query(
-        "SELECT id FROM findings WHERE html_url=$1",
-        [item.html_url]
-      );
-
-      if (exists.rows.length) continue;
-
-      const content = await fetchFileContent(item);
+      const content = await fetchFile(item);
       if (!content) continue;
 
-      const { findings, score } = detectSecrets(content);
+      const signals = extractSignals(content);
 
-      const severity =
-        score >= 15 ? "HIGH" : score >= 7 ? "MEDIUM" : "LOW";
+      updateRepo(item.repository.full_name, signals);
 
-      // mark processed EARLY (prevents duplicates across keywords)
       processedUrls.add(item.html_url);
 
-      await safeInsert(item, keyword, score, severity);
-
-      if (score >= ALERT_THRESHOLD) {
-        await sendTelegram(
-          `🚨 SECURITY ALERT
-
-Score: ${score}
-Severity: ${severity}
-Keyword: ${keyword}
-
-Repo: ${item.repository.full_name}
-File: ${item.path}
-
-Findings:
-${JSON.stringify(findings, null, 2)}
-
-${item.html_url}`
-        );
-
-        // FIX #6: mark alerted
-        await pool.query(
-          "UPDATE findings SET alerted=TRUE WHERE html_url=$1",
-          [item.html_url]
-        );
-
-        console.log("🚨 ALERT:", item.html_url);
-      } else {
-        console.log("✔ OK:", item.html_url);
-      }
     } catch (err) {
       console.error("Process error:", err.message);
     }
@@ -382,41 +253,81 @@ ${item.html_url}`
 }
 
 // =========================
-// CYCLE (FIX #2)
+// FINAL REPO EVALUATION
+// =========================
+
+async function evaluateRepos() {
+  for (const [repoName, repo] of repoCache.entries()) {
+
+    const score = computeRepoScore(repo);
+
+    let severity =
+      score >= 35 ? "CONFIRMED DRAINER" :
+      score >= 25 ? "HIGH RISK" :
+      score >= 15 ? "SUSPICIOUS" :
+      "LOW";
+
+    await pool.query(
+      `INSERT INTO findings (keyword, repo_name, file_path, html_url, score, severity)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT DO NOTHING`,
+      ["repo-analysis", repoName, null, null, score, severity]
+    );
+
+    if (score >= ALERT_THRESHOLD) {
+      await sendTelegram(
+`🚨 DRAINER INTELLIGENCE ALERT
+
+Repo: ${repoName}
+Score: ${score}
+Severity: ${severity}
+
+Files analyzed: ${repo.files}
+
+SignalScore: ${repo.signalScore}
+BehaviorScore: ${repo.behaviorScore}
+LegitPenalty: ${repo.legitPenalty}`
+      );
+
+      console.log("🚨 ALERT:", repoName);
+    }
+  }
+}
+
+// =========================
+// CYCLE
 // =========================
 
 async function runCycle() {
-  console.log("🔄 Scan cycle starting...");
+  console.log("🔄 Scan cycle started");
 
   processedUrls.clear();
+  repoCache.clear();
 
   for (const keyword of KEYWORDS) {
-    console.log("🔎", keyword);
-
     await processKeyword(keyword);
-
-    await new Promise((r) => setTimeout(r, BASE_SLEEP));
+    await new Promise(r => setTimeout(r, BASE_SLEEP));
   }
+
+  await evaluateRepos();
 
   console.log("✅ Cycle complete");
 }
 
 // =========================
-// WORKER LOOP
+// WORKER
 // =========================
 
 async function startWorker() {
-  console.log("🚀 Scanner started");
+  console.log("🚀 Drainer Classifier v2 started");
 
   while (true) {
     try {
       await runCycle();
-
-      console.log("💤 Sleeping 10 minutes...");
-      await new Promise((r) => setTimeout(r, 10 * 60 * 1000));
-    } catch (err) {
-      console.error("Worker crash:", err.message);
-      await new Promise((r) => setTimeout(r, 5000));
+      console.log("💤 sleeping...");
+      await new Promise(r => setTimeout(r, 10 * 60 * 1000));
+    } catch (e) {
+      console.error("Worker crash:", e.message);
     }
   }
 }
