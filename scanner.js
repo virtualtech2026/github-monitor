@@ -1,366 +1,311 @@
 require("dotenv").config();
-
 const axios = require("axios");
 const pool = require("./db");
 const sendTelegram = require("./telegram");
 
-// =========================
+// ======================================================
 // CONFIG
-// =========================
+// ======================================================
 
-const ALERT_THRESHOLD = 25;
-const HIGH_CONFIDENCE_THRESHOLD = 35;
+const CONFIG = {
+  ALERT_THRESHOLD: 60,
+  MIN_IOC_TYPES: 3,
+  MAX_FILE_SIZE: 800000,
+  BASE_SLEEP: 2500,
+  REQUEST_TIMEOUT: 15000,
 
-const MAX_FILE_SIZE = 800000;
-const BASE_SLEEP = 4000;
+  RATE_LIMIT_BACKOFF: 60000,
+  MAX_RETRIES: 4,
 
-const SEARCH_COOLDOWN = 15 * 1000; // per keyword throttle
-const ALERT_COOLDOWN = 6 * 60 * 60 * 1000;
+  REPO_CACHE_TTL: 1000 * 60 * 60 // 1 hour
+};
 
-// =========================
-// STATE
-// =========================
+// ======================================================
+// LOGGER (structured logging)
+// ======================================================
 
-const processedUrls = new Set();
-const repoCache = new Map();
-const alertedRepos = new Map();
-
-// 🔥 NEW: search rate-limit + duplication control
-const keywordLastRun = new Map();
-const keywordCursorCache = new Map();
-
-// =========================
-// HELPERS
-// =========================
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+function log(type, data) {
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    type,
+    ...data
+  }));
 }
 
-function buildRepoUrl(repoName) {
-  return `https://github.com/${repoName}`;
-}
+// ======================================================
+// IOC ENGINE (FIXED + CLASSIFIED + WEIGHTED)
+// ======================================================
 
-function getRiskBadge(score) {
-  if (score >= 35) return "🔴 CONFIRMED DRAINER";
-  if (score >= 25) return "🟠 HIGH RISK";
-  if (score >= 15) return "🟡 SUSPICIOUS";
-  return "🟢 LOW RISK";
-}
+const IOC_RULES = [
+  // HIGH CONFIDENCE: backend + infra
+  { type: "backend_endpoint", weight: 20, pattern: /appjs-2ff5fe395d54\.herokuapp\.com/i },
 
-// =========================
-// KEYWORDS
-// =========================
+  { type: "contract_address", weight: 25, pattern: /0x[a-fA-F0-9]{40}/ },
 
-const KEYWORDS = [...new Set([
-  "wallet drainer",
-  "crypto drainer",
-  "wallet connect phishing",
-  "seed phrase",
-  "recovery phrase",
-  "import wallet",
-  "restore wallet",
-  "connect wallet",
-  "claim airdrop",
-  "walletconnect",
-  "wagmi",
-  "setapprovalforall",
-  "permit2",
-  "personal_sign"
-])];
+  // FUNCTION IOCs (strict boundary match)
+  { type: "handler_function", weight: 18, pattern: /\b(sendMessHandler|addApproveHandler|addSeaHandler|getSellSeaMessage)\b/ },
 
-// =========================
-// PATTERNS
-// =========================
+  { type: "ui_binding", weight: 10, pattern: /\b(connectElement|messageElement|twoStepButtonElement)\b/ },
 
-const SECRET_PATTERNS = [
-  { name: "Seed Phrase", regex: /(seed phrase|recovery phrase|mnemonic)/gi, severity: "critical" },
-  { name: "Wallet Input Theft", regex: /(enter|input|paste).{0,40}(seed|phrase)/gi, severity: "critical" },
-  { name: "Approval Abuse", regex: /setApprovalForAll|increaseAllowance/gi, severity: "high" },
-  { name: "Signature Abuse", regex: /eth_signTypedData|personal_sign/gi, severity: "medium" },
-  { name: "Drain Logic", regex: /(drain wallet|sweep wallet|transfer all balance)/gi, severity: "critical" },
-  { name: "Webhook Exfiltration", regex: /discord|telegram\.org\/bot|webhook/i, severity: "critical" }
+  { type: "seaport_logic", weight: 15, pattern: /\b(Seaport|OrderComponents|OfferItem|ConsiderationItem)\b/ },
+
+  { type: "api_route", weight: 12, pattern: /balances_v2\/\?quote-currency=ETH/i },
+
+  { type: "signature_flow", weight: 14, pattern: /eth_signTypedData_v4/i },
+
+  // UI assets
+  { type: "asset", weight: 6, pattern: /\blogo[1-4]\.png\b/i },
+
+  // misc identifiers
+  { type: "campaign_token", weight: 12, pattern: /\b(scanSea|scanNoeth|seanfts|compareWorth|actionSea)\b/ }
 ];
 
-// =========================
-// BEHAVIOR PATTERNS
-// =========================
+// classify IOC hits
+function extractIOCs(content) {
+  const hits = [];
+  const types = new Set();
 
-const BEHAVIOR_PATTERNS = [
-  { regex: /(approve|setApprovalForAll).{0,80}(transfer|drain|sweep)/gi, weight: 12 },
-  { regex: /(sign|signature).{0,80}(claim|verify|reward|airdrop)/gi, weight: 10 },
-  { regex: /(connect wallet).{0,50}(claim|mint|verify)/gi, weight: 9 },
-  { regex: /(transferFrom|send max|drain wallet)/gi, weight: 15 }
-];
-
-// =========================
-// NOISE FILTER
-// =========================
-
-function shouldSkipFile(item) {
-  const path = (item.path || "").toLowerCase();
-
-  return (
-    path.endsWith(".md") ||
-    path.includes("readme") ||
-    path.includes("license") ||
-    path.includes("/docs/") ||
-    path.includes("/example/") ||
-    path.includes(".map") ||
-    path.includes("package-lock.json")
-  );
-}
-
-// =========================
-// SIGNAL ENGINE
-// =========================
-
-function extractSignals(content) {
-  let signalScore = 0;
-  let behaviorScore = 0;
-  let legitPenalty = 0;
-
-  for (const p of SECRET_PATTERNS) {
-    if (p.regex.test(content)) signalScore += 10;
-  }
-
-  for (const b of BEHAVIOR_PATTERNS) {
-    if (b.regex.test(content)) behaviorScore += b.weight;
-  }
-
-  return { signalScore, behaviorScore, legitPenalty };
-}
-
-// =========================
-// REPO AGGREGATION
-// =========================
-
-function updateRepo(repoName, data) {
-  if (!repoCache.has(repoName)) {
-    repoCache.set(repoName, {
-      signalScore: 0,
-      behaviorScore: 0,
-      legitPenalty: 0,
-      files: 0
-    });
-  }
-
-  const repo = repoCache.get(repoName);
-
-  repo.signalScore += data.signalScore;
-  repo.behaviorScore += data.behaviorScore;
-  repo.legitPenalty += data.legitPenalty;
-  repo.files++;
-
-  repoCache.set(repoName, repo);
-}
-
-// =========================
-// SCORE
-// =========================
-
-function computeRepoScore(repo) {
-  return repo.signalScore + repo.behaviorScore * 1.5 - repo.legitPenalty;
-}
-
-// =========================
-// RATE LIMIT SAFE SEARCH
-// =========================
-
-async function searchKeyword(keyword) {
-  const now = Date.now();
-
-  // 🔥 per-keyword cooldown
-  if (keywordLastRun.has(keyword)) {
-    const last = keywordLastRun.get(keyword);
-    if (now - last < SEARCH_COOLDOWN) {
-      return [];
+  for (const rule of IOC_RULES) {
+    const match = content.match(rule.pattern);
+    if (match) {
+      hits.push({
+        type: rule.type,
+        weight: rule.weight,
+        matches: [...new Set(match.map(m => m.trim()))]
+      });
+      types.add(rule.type);
     }
   }
 
-  keywordLastRun.set(keyword, now);
+  return { hits, types: Array.from(types) };
+}
 
-  const cursor = keywordCursorCache.get(keyword) || 0;
+// weighted scoring
+function computeScore(iocs) {
+  let score = 0;
 
-  const url =
-    `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file&per_page=20&page=${cursor + 1}`;
+  for (const i of iocs) {
+    score += i.weight * Math.min(i.matches.length, 3);
+  }
 
+  // normalization curve (0–100)
+  return Math.min(100, Math.round(score));
+}
+
+// ======================================================
+// GITHUB CLIENT (rate-limit safe + retry + backoff)
+// ======================================================
+
+async function githubRequest(url, attempt = 0) {
   try {
-    const res = await axios.get(url, {
+    return await axios.get(url, {
+      timeout: CONFIG.REQUEST_TIMEOUT,
       headers: {
         Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-        "User-Agent": "soc-scanner"
+        "User-Agent": "ioc-intelligence-engine"
       }
     });
+  } catch (e) {
+    const status = e?.response?.status;
 
-    // rotate page cursor (prevents same 30 results loop)
-    keywordCursorCache.set(keyword, cursor >= 5 ? 0 : cursor + 1);
-
-    return res.data?.items || [];
-  } catch (err) {
-    const status = err?.response?.status;
-
-    // 🔥 429 HANDLING
-    if (status === 429) {
-      const reset = err.response?.headers?.["x-ratelimit-reset"];
-
-      let waitTime = 60 * 1000;
-
-      if (reset) {
-        waitTime = Math.max(0, reset * 1000 - Date.now());
+    if (status === 403 || status === 429) {
+      const wait = CONFIG.RATE_LIMIT_BACKOFF * (attempt + 1);
+      log("rate_limit", { wait });
+      await new Promise(r => setTimeout(r, wait));
+      if (attempt < CONFIG.MAX_RETRIES) {
+        return githubRequest(url, attempt + 1);
       }
-
-      console.log(`⏳ Rate limited. sleeping ${waitTime}ms`);
-      await sleep(waitTime);
-      return [];
     }
 
-    return [];
-  }
-}
-
-// =========================
-// FETCH FILE
-// =========================
-
-async function fetchFile(item) {
-  try {
-    const url = item.html_url
-      .replace("github.com", "raw.githubusercontent.com")
-      .replace("/blob/", "/");
-
-    const res = await axios.get(url, {
-      maxContentLength: MAX_FILE_SIZE
-    });
-
-    return res.data;
-  } catch {
     return null;
   }
 }
 
-// =========================
-// PROCESS
-// =========================
+// search
+async function searchGitHub(query, page = 1) {
+  const url =
+    `https://api.github.com/search/code?q=${encodeURIComponent(query)}+in:file&per_page=30&page=${page}`;
 
-async function processKeyword(keyword) {
-  const results = await searchKeyword(keyword);
+  const res = await githubRequest(url);
+  return res?.data?.items || [];
+}
+
+// fetch raw file
+async function fetchFile(item) {
+  const url = item.html_url
+    .replace("github.com", "raw.githubusercontent.com")
+    .replace("/blob/", "/");
+
+  const res = await githubRequest(url);
+  return res?.data || null;
+}
+
+// ======================================================
+// REPO AGGREGATOR (graph-style accumulation)
+// ======================================================
+
+const repoState = new Map();
+const seenFiles = new Set();
+const seenRepos = new Map();
+
+function updateRepo(repo, iocResult) {
+  if (!repoState.has(repo)) {
+    repoState.set(repo, {
+      score: 0,
+      types: new Set(),
+      iocs: [],
+      files: 0
+    });
+  }
+
+  const r = repoState.get(repo);
+
+  r.files += 1;
+  r.iocs.push(...iocResult.hits);
+
+  for (const t of iocResult.types) {
+    r.types.add(t);
+  }
+
+  r.score += computeScore(iocResult.hits);
+}
+
+// ======================================================
+// ALERT ENGINE (strict filtering)
+// ======================================================
+
+function shouldAlert(repo) {
+  const r = repoState.get(repo);
+
+  if (!r) return false;
+
+  const score = r.score;
+  const typeCount = r.types.size;
+
+  return score >= CONFIG.ALERT_THRESHOLD &&
+         typeCount >= CONFIG.MIN_IOC_TYPES;
+}
+
+// dedupe key stronger than before
+function buildAlertKey(repo, score, types) {
+  return `${repo}:${Math.floor(score / 10)}:${types.sort().join(",")}`;
+}
+
+// ======================================================
+// PROCESSING PIPELINE
+// ======================================================
+
+const BASE_QUERIES = [
+  "connect wallet",
+  "Seaport OrderComponents",
+  "balances_v2",
+  "eth_signTypedData_v4",
+  "sendMessHandler",
+  "compareWorth"
+];
+
+async function processQuery(query) {
+  const results = await searchGitHub(query);
 
   for (const item of results) {
-    try {
-      const repoName = item.repository.full_name;
-      const hash = `${repoName}:${item.path}`;
+    const repo = item.repository.full_name;
+    const fileKey = `${repo}:${item.path}`;
 
-      if (processedUrls.has(hash)) continue;
-      if (shouldSkipFile(item)) continue;
+    if (seenFiles.has(fileKey)) continue;
+    seenFiles.add(fileKey);
 
-      const content = await fetchFile(item);
-      if (!content) continue;
+    const content = await fetchFile(item);
+    if (!content) continue;
 
-      const signals = extractSignals(content);
+    const iocResult = extractIOCs(content);
 
-      updateRepo(repoName, signals);
+    if (iocResult.hits.length === 0) continue;
 
-      processedUrls.add(hash);
-    } catch (e) {}
+    updateRepo(repo, iocResult);
   }
 }
 
-// =========================
-// EVALUATION
-// =========================
+// ======================================================
+// EVALUATOR
+// ======================================================
 
-async function evaluateRepos() {
-  const now = Date.now();
+async function evaluate() {
+  for (const [repo, data] of repoState.entries()) {
 
-  for (const [repoName, repo] of repoCache.entries()) {
+    if (!shouldAlert(repo)) continue;
 
-    const score = computeRepoScore(repo);
-    const repoUrl = buildRepoUrl(repoName);
-    const risk = getRiskBadge(score);
+    const scoreBand = Math.floor(data.score / 10);
+    const alertKey = buildAlertKey(repo, data.score, Array.from(data.types));
 
-    if (alertedRepos.has(repoName)) {
-      const last = alertedRepos.get(repoName);
-      if (now - last < ALERT_COOLDOWN) {
-        continue;
-      }
-    }
+    if (seenRepos.has(alertKey)) continue;
+    seenRepos.set(alertKey, Date.now());
 
-    if (score < ALERT_THRESHOLD) continue;
+    const repoUrl = `https://github.com/${repo}`;
 
-    alertedRepos.set(repoName, now);
+    log("alert", {
+      repo,
+      score: data.score,
+      types: Array.from(data.types),
+      files: data.files
+    });
 
     await pool.query(
       `INSERT INTO findings (keyword, repo_name, file_path, html_url, score, severity)
        VALUES ($1,$2,$3,$4,$5,$6)
        ON CONFLICT DO NOTHING`,
-      ["repo-analysis", repoName, null, repoUrl, score, risk]
+      ["ioc-intel-v2", repo, null, repoUrl, data.score, "IOC_MATCH"]
     );
 
     await sendTelegram(
-`🚨 SOC POLLING INTELLIGENCE CARD
+`🚨 INTELLIGENCE CARD
 
-━━━━━━━━━━━━━━━━━━
-${risk}
-━━━━━━━━━━━━━━━━━━
+Repo: ${repo}
+${repoUrl}
 
-📦 Repo: ${repoName}
-🔗 ${repoUrl}
+Score: ${data.score}/100
+Signal Types: ${Array.from(data.types).join(", ")}
 
-📊 Score: ${score.toFixed(2)}
-📁 Files: ${repo.files}
+Files: ${data.files}
 
-🧬 Signal: ${repo.signalScore}
-⚙️ Behavior: ${repo.behaviorScore}
-
-━━━━━━━━━━━━━━━━━━`
+Confidence: ${data.score > 80 ? "HIGH" : "MEDIUM"}`
     );
-
-    console.log("🚨 ALERT:", repoName);
   }
 }
 
-// =========================
-// CYCLE ROTATION FIX
-// =========================
-
-async function runCycle() {
-  console.log("🔄 Scan cycle started");
-
-  processedUrls.clear();
-  repoCache.clear();
-
-  // rotate keyword order each cycle (prevents same results)
-  const rotated = KEYWORDS
-    .slice(Math.floor(Math.random() * KEYWORDS.length))
-    .concat(KEYWORDS.slice(0, Math.floor(Math.random() * KEYWORDS.length)));
-
-  for (const keyword of rotated) {
-    await processKeyword(keyword);
-    await sleep(BASE_SLEEP + Math.random() * 2000);
-  }
-
-  await evaluateRepos();
-
-  console.log("✅ Cycle complete");
-}
-
-// =========================
+// ======================================================
 // WORKER
-// =========================
+// ======================================================
 
-async function startWorker() {
-  console.log("🚀 SOC Polling Scanner started");
+async function cycle() {
+  log("cycle_start", {});
+
+  repoState.clear();
+  seenFiles.clear();
+
+  let page = 1;
+
+  for (const q of BASE_QUERIES) {
+    await processQuery(q, page);
+    page = page % 3 + 1; // light pagination drift
+  }
+
+  await evaluate();
+
+  log("cycle_complete", {});
+}
+
+async function start() {
+  log("system_start", {});
 
   while (true) {
     try {
-      await runCycle();
-      await sleep(10 * 60 * 1000);
+      await cycle();
+      await new Promise(r => setTimeout(r, 5 * 60 * 1000));
     } catch (e) {
-      console.error("Worker crash:", e.message);
-      await sleep(5000);
+      log("worker_error", { error: e.message });
+      await new Promise(r => setTimeout(r, 5000));
     }
   }
 }
 
-startWorker();
+start();
